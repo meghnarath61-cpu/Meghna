@@ -1,0 +1,452 @@
+import React, { useState, useEffect } from 'react';
+import { Header } from './components/Header';
+import { StatsCards } from './components/StatsCards';
+import { RegistrationForm } from './components/RegistrationForm';
+import { VaxMap } from './components/VaxMap';
+import { OutreachTable } from './components/OutreachTable';
+import { ExplainabilityModal } from './components/ExplainabilityModal';
+import { VisitStatusModal } from './components/VisitStatusModal';
+import { PrintVisitSheet } from './components/PrintVisitSheet';
+import { GuidanceSection } from './components/GuidanceSection';
+import { AnalyticsSection } from './components/AnalyticsSection';
+import { VaccinationTracker } from './components/VaccinationTracker';
+import { HealthExpertModal } from './components/HealthExpertModal';
+import { ChildRecord, PriorityFilter } from './types';
+import { INITIAL_MOCK_RECORDS } from './data/mockData';
+import { findNearestPHC } from './utils/distance';
+import { evaluateRisk } from './utils/riskEngine';
+import { REGIONAL_PRESETS } from './data/phcDataset';
+import { generateInitialVaccineTrackerData, recordAdministeredDose } from './data/uipSchedule';
+
+const STORAGE_KEY = 'vaxreach_registrations_v2';
+
+export default function App() {
+  const [records, setRecords] = useState<ChildRecord[]>(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        return JSON.parse(stored);
+      }
+    } catch (err) {
+      console.error('Failed to load records from localStorage', err);
+    }
+    return INITIAL_MOCK_RECORDS;
+  });
+
+  const [activeSection, setActiveSection] = useState<string>('dashboard');
+  const [selectedCoord, setSelectedCoord] = useState<{ lat: number; lng: number } | null>(null);
+  const [activeChild, setActiveChild] = useState<ChildRecord | null>(null);
+  const [explainChild, setExplainChild] = useState<ChildRecord | null>(null);
+  const [statusChild, setStatusChild] = useState<ChildRecord | null>(null);
+  const [isExpertModalOpen, setIsExpertModalOpen] = useState<boolean>(false);
+
+  // Sync to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(records));
+    } catch (err) {
+      console.error('Failed to save records', err);
+    }
+  }, [records]);
+
+  // Handler to add new record
+  const handleAddRecord = (newRec: ChildRecord) => {
+    setRecords((prev) => {
+      const updated = [newRec, ...prev];
+      // Sort with highest risk score first as mandated
+      return updated.sort((a, b) => b.risk.score - a.risk.score);
+    });
+    setActiveChild(newRec);
+  };
+
+  // Handler to delete record
+  const handleDeleteRecord = (id: string) => {
+    if (confirm('Are you sure you want to remove this beneficiary record?')) {
+      setRecords((prev) => prev.filter((r) => r.id !== id));
+      if (activeChild?.id === id) setActiveChild(null);
+      if (explainChild?.id === id) setExplainChild(null);
+      if (statusChild?.id === id) setStatusChild(null);
+    }
+  };
+
+  // Handler to reset default seed data
+  const handleResetSeedData = () => {
+    if (confirm('Reset to initial Pan-India seed dataset?')) {
+      setRecords(INITIAL_MOCK_RECORDS);
+      setActiveChild(null);
+    }
+  };
+
+  // Handler to record an administered vaccine dose directly in the Tracker
+  const handleRecordDose = (
+    childId: string,
+    vaccineName: string,
+    dateAdministered: string,
+    facility: string,
+    administeredBy?: string,
+    batchNumber?: string
+  ) => {
+    setRecords((prev) =>
+      prev.map((rec) => {
+        if (rec.id !== childId) return rec;
+
+        const { lastVaccineTaken, nextVaccineDue, updatedHistory } = recordAdministeredDose(
+          rec.doseHistory || [],
+          vaccineName,
+          facility,
+          dateAdministered,
+          administeredBy,
+          batchNumber
+        );
+
+        const newMissed = Math.max(0, rec.missedSessions - 1);
+        const newDays = 0;
+        const updatedRisk = evaluateRisk(
+          newMissed,
+          newDays,
+          rec.nearestPHC.distance,
+          rec.isMigrated,
+          rec.hasHesitancy
+        );
+
+        return {
+          ...rec,
+          status: 'Vaccinated',
+          missedSessions: newMissed,
+          daysSince: newDays,
+          risk: updatedRisk,
+          lastVaccineTaken,
+          nextVaccineDue,
+          doseHistory: updatedHistory,
+        };
+      })
+    );
+  };
+
+  // Handler to add a randomized realistic sample child
+  const handleAddRandomSample = () => {
+    const randomPreset = REGIONAL_PRESETS[Math.floor(Math.random() * REGIONAL_PRESETS.length)];
+    const names = [
+      'Priya Behera',
+      'Ananya Das',
+      'Manish Sahoo',
+      'Karan Singh',
+      'Fatima Begum',
+      'Rohit Jha',
+      'Deepak Yadav',
+      'Meera Nair',
+    ];
+    const parents = [
+      'Santosh Behera',
+      'Bikash Das',
+      'Trilochan Sahoo',
+      'Balvinder Singh',
+      'Arif Begum',
+      'Suresh Jha',
+      'Ramlal Yadav',
+      'Gopal Nair',
+    ];
+    const randomIndex = Math.floor(Math.random() * names.length);
+    const missed = Math.floor(Math.random() * 4);
+    const days = Math.floor(Math.random() * 80) + 10;
+    const isMigrated = Math.random() > 0.6;
+    const hasHesitancy = Math.random() > 0.5;
+    const ageMonths = Math.floor(Math.random() * 20) + 2;
+
+    // Small jitter to lat/lng so marker is distinct
+    const jitterLat = randomPreset.lat + (Math.random() - 0.5) * 0.08;
+    const jitterLng = randomPreset.lng + (Math.random() - 0.5) * 0.08;
+
+    const nearestPHC = findNearestPHC(jitterLat, jitterLng);
+    const risk = evaluateRisk(missed, days, nearestPHC.distance, isMigrated, hasHesitancy);
+    const trackerData = generateInitialVaccineTrackerData(ageMonths, missed, nearestPHC.name);
+
+    const sampleRecord: ChildRecord = {
+      id: 'REC_' + Date.now(),
+      childName: names[randomIndex],
+      parentName: parents[randomIndex],
+      phone: `9${Math.floor(100000000 + Math.random() * 900000000)}`,
+      ageMonths,
+      gender: Math.random() > 0.5 ? 'Female' : 'Male',
+      locality: randomPreset.name.split(',')[0],
+      state: randomPreset.state,
+      lat: jitterLat,
+      lng: jitterLng,
+      missedSessions: missed,
+      daysSince: days,
+      dueVaccines: ['Pentavalent 3', 'MR-1', 'Rotavirus 3'],
+      isMigrated,
+      hasHesitancy,
+      nearestPHC,
+      risk,
+      status: 'Pending Visit',
+      registeredAt: new Date().toISOString(),
+      notes: 'Generated field case for community priority calibration.',
+      lastVaccineTaken: trackerData.lastVaccineTaken,
+      nextVaccineDue: trackerData.nextVaccineDue,
+      doseHistory: trackerData.doseHistory,
+    };
+
+    handleAddRecord(sampleRecord);
+  };
+
+  // Update status handler
+  const handleUpdateStatus = (
+    id: string,
+    status: ChildRecord['status'],
+    notes: string,
+    missedSessionsReduction?: boolean,
+    administeredVaccineName?: string
+  ) => {
+    setRecords((prev) =>
+      prev.map((rec) => {
+        if (rec.id !== id) return rec;
+
+        let lastVaccineTaken = rec.lastVaccineTaken;
+        let nextVaccineDue = rec.nextVaccineDue;
+        let doseHistory = rec.doseHistory;
+
+        if (status === 'Vaccinated' && administeredVaccineName) {
+          const prog = recordAdministeredDose(
+            rec.doseHistory || [],
+            administeredVaccineName,
+            rec.nearestPHC.name
+          );
+          lastVaccineTaken = prog.lastVaccineTaken;
+          nextVaccineDue = prog.nextVaccineDue;
+          doseHistory = prog.updatedHistory;
+        }
+
+        const newMissed = missedSessionsReduction ? Math.max(0, rec.missedSessions - 1) : rec.missedSessions;
+        const newDays = missedSessionsReduction ? 0 : rec.daysSince;
+        const updatedRisk = evaluateRisk(
+          newMissed,
+          newDays,
+          rec.nearestPHC.distance,
+          rec.isMigrated,
+          rec.hasHesitancy
+        );
+
+        return {
+          ...rec,
+          status,
+          notes,
+          missedSessions: newMissed,
+          daysSince: newDays,
+          risk: updatedRisk,
+          lastVaccineTaken,
+          nextVaccineDue,
+          doseHistory,
+        };
+      })
+    );
+  };
+
+  // If user is in print view
+  if (activeSection === 'print') {
+    return (
+      <div className="min-h-screen bg-slate-100 py-6 px-4">
+        <PrintVisitSheet
+          records={records}
+          onBack={() => setActiveSection('dashboard')}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col text-slate-800">
+      {/* Top Header */}
+      <Header
+        onOpenRegister={() => {
+          setActiveSection('dashboard');
+          window.scrollTo({ top: 120, behavior: 'smooth' });
+        }}
+        onOpenPrint={() => setActiveSection('print')}
+        onOpenExpert={() => setIsExpertModalOpen(true)}
+        activeSection={activeSection}
+        setActiveSection={setActiveSection}
+      />
+
+      {/* Main Content Area */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-8 py-6">
+        {/* Top KPI Metrics Banner */}
+        <StatsCards
+          records={records}
+          onFilterPriority={(p) => {
+            setActiveSection('dashboard');
+          }}
+          onFilterBarrier={(b) => {
+            setActiveSection('dashboard');
+          }}
+        />
+
+        {/* Tab 1: Core Dashboard (Form + Map Split + Table) */}
+        {activeSection === 'dashboard' && (
+          <div className="space-y-6">
+            {/* 2-Column Split: Registration Form (Left) & Leaflet Interactive Map (Right) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              {/* Form Container (5 cols on lg) */}
+              <div className="lg:col-span-5">
+                <RegistrationForm
+                  onAddRecord={handleAddRecord}
+                  selectedCoord={selectedCoord}
+                  onClearCoordSelection={() => setSelectedCoord(null)}
+                />
+              </div>
+
+              {/* Map Container (7 cols on lg) */}
+              <div className="lg:col-span-7">
+                <VaxMap
+                  records={records}
+                  onSelectCoord={(coord) => setSelectedCoord(coord)}
+                  activeChild={activeChild}
+                  onChildClick={(child) => setActiveChild(child)}
+                />
+              </div>
+            </div>
+
+            {/* Field Outreach Roster Table */}
+            <OutreachTable
+              records={records}
+              onSelectChild={(child) => {
+                setActiveChild(child);
+                window.scrollTo({ top: 100, behavior: 'smooth' });
+              }}
+              onOpenTracker={(child) => {
+                setActiveChild(child);
+                setActiveSection('tracker');
+              }}
+              onOpenExplainability={(child) => setExplainChild(child)}
+              onOpenStatusModal={(child) => setStatusChild(child)}
+              onDeleteRecord={handleDeleteRecord}
+              onResetSeedData={handleResetSeedData}
+              onAddRandomSample={handleAddRandomSample}
+            />
+          </div>
+        )}
+
+        {/* Tab 2: Dedicated Vaccination Tracker */}
+        {activeSection === 'tracker' && (
+          <div className="space-y-6">
+            <VaccinationTracker
+              records={records}
+              onRecordDose={handleRecordDose}
+              onSelectChildForMap={(child) => {
+                setActiveChild(child);
+                setActiveSection('map');
+              }}
+            />
+            <OutreachTable
+              records={records}
+              onSelectChild={(child) => setActiveChild(child)}
+              onOpenTracker={(child) => {
+                setActiveChild(child);
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              onOpenExplainability={(child) => setExplainChild(child)}
+              onOpenStatusModal={(child) => setStatusChild(child)}
+              onDeleteRecord={handleDeleteRecord}
+              onResetSeedData={handleResetSeedData}
+              onAddRandomSample={handleAddRandomSample}
+            />
+          </div>
+        )}
+
+        {/* Tab 3: Full Map Network View */}
+        {activeSection === 'map' && (
+          <div className="space-y-4">
+            <VaxMap
+              records={records}
+              onSelectCoord={(coord) => setSelectedCoord(coord)}
+              activeChild={activeChild}
+              onChildClick={(child) => setActiveChild(child)}
+            />
+            <OutreachTable
+              records={records}
+              onSelectChild={(child) => setActiveChild(child)}
+              onOpenTracker={(child) => {
+                setActiveChild(child);
+                setActiveSection('tracker');
+              }}
+              onOpenExplainability={(child) => setExplainChild(child)}
+              onOpenStatusModal={(child) => setStatusChild(child)}
+              onDeleteRecord={handleDeleteRecord}
+              onResetSeedData={handleResetSeedData}
+              onAddRandomSample={handleAddRandomSample}
+            />
+          </div>
+        )}
+
+        {/* Tab 4: Drop-Out Root Cause Analytics */}
+        {activeSection === 'analytics' && (
+          <div className="space-y-6">
+            <AnalyticsSection records={records} />
+            <OutreachTable
+              records={records}
+              onSelectChild={(child) => setActiveChild(child)}
+              onOpenTracker={(child) => {
+                setActiveChild(child);
+                setActiveSection('tracker');
+              }}
+              onOpenExplainability={(child) => setExplainChild(child)}
+              onOpenStatusModal={(child) => setStatusChild(child)}
+              onDeleteRecord={handleDeleteRecord}
+              onResetSeedData={handleResetSeedData}
+              onAddRandomSample={handleAddRandomSample}
+            />
+          </div>
+        )}
+
+        {/* Tab 5: ASHA Field Worker Protocols & Guidance */}
+        {activeSection === 'guidance' && (
+          <div className="space-y-6">
+            <GuidanceSection />
+            <OutreachTable
+              records={records}
+              onSelectChild={(child) => setActiveChild(child)}
+              onOpenTracker={(child) => {
+                setActiveChild(child);
+                setActiveSection('tracker');
+              }}
+              onOpenExplainability={(child) => setExplainChild(child)}
+              onOpenStatusModal={(child) => setStatusChild(child)}
+              onDeleteRecord={handleDeleteRecord}
+              onResetSeedData={handleResetSeedData}
+              onAddRandomSample={handleAddRandomSample}
+            />
+          </div>
+        )}
+      </main>
+
+      {/* Footer */}
+      <footer className="mt-auto border-t border-slate-200 bg-white py-4 px-6 text-center text-xs text-slate-500">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2">
+          <span>
+            <strong>VaxReach</strong> · Immunization Gap Detection &amp; Outreach Planning Platform
+          </span>
+          <span className="text-[11px] text-slate-400">
+            Compliant with Universal Immunization Programme (UIP) &amp; National Health Mission Guidelines
+          </span>
+        </div>
+      </footer>
+
+      {/* Modals */}
+      <ExplainabilityModal
+        child={explainChild}
+        onClose={() => setExplainChild(null)}
+      />
+
+      <VisitStatusModal
+        child={statusChild}
+        onClose={() => setStatusChild(null)}
+        onUpdateStatus={handleUpdateStatus}
+      />
+
+      <HealthExpertModal
+        isOpen={isExpertModalOpen}
+        onClose={() => setIsExpertModalOpen(false)}
+      />
+    </div>
+  );
+}
